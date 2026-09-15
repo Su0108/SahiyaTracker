@@ -72,6 +72,9 @@
       "purpose": "maskable"
     }
   ],
-  "categories": ["health", "medical", "productivity"],
-  "screenshots": []
+  "categories": [
+    "health",
+    "medical",
+    "productivity"
+  ]
 }
