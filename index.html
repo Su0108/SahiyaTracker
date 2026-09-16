@@ -1400,6 +1400,13 @@ function downloadFamilyPDF(){
   doc.text('Generated: '+new Date().toLocaleString(), marginX, y);
   y += 24;
 
+  sectionTitle('Sahiya Details');
+  field('Sahiya Name', state.profile.name);
+  field('Sahiya Code', state.profile.code);
+  field('Phone No.', state.profile.number);
+  field('Address', state.profile.address);
+  y += 6;
+
   sectionTitle('Family Details');
   field('Family ID', b.family.id);
   field('House No.', b.family.houseNo);
@@ -1413,13 +1420,14 @@ function downloadFamilyPDF(){
   field('Next Visit', b.family.nextVisit);
   field('Any Disability Person', b.family.disability);
   y += 6;
-  if(b.family.members && b.family.members.length){
+  const nonHeadMembers = (b.family.members || []).filter(m=>!m.isHead);
+  if(nonHeadMembers.length){
     ensureSpace(lineH);
     doc.setFont(undefined,'bold'); doc.text('Family Members:', marginX, y); y += lineH;
     doc.setFont(undefined,'normal');
-    b.family.members.forEach(m=>{
+    nonHeadMembers.forEach(m=>{
       ensureSpace(lineH);
-      doc.text('• '+(m.name||'—')+'  ('+(m.gender||'—')+', DOB: '+(m.dob||'—')+', Age: '+(m.age||'—')+')'+(m.isHead?' [Head]':''), marginX+10, y);
+      doc.text('• '+(m.name||'—')+'  ('+(m.gender||'—')+', DOB: '+(m.dob||'—')+', Age: '+(m.age||'—')+', Aadhar: '+(m.aadhar||'—')+')', marginX+10, y);
       y += lineH;
     });
   }
@@ -2743,7 +2751,7 @@ function screenFormFamily(){
   const src = editFam ? (editFam.pendingEdit || editFam) : null;
   setTimeout(()=>{
     if(src){
-      (src.members && src.members.length ? src.members : []).forEach(m=>addMemberRow(m.name||'', m.dob||'', m.gender||'Male', m.aadhar||''));
+      (src.members && src.members.length ? src.members.filter(m=>!m.isHead) : []).forEach(m=>addMemberRow(m.name||'', m.dob||'', m.gender||'Male', m.aadhar||''));
       (src.otherPhones||[]).forEach(p=>addPhoneRow(p));
     } else {
       // Start blank — the Sahiya adds members with "+ Add Member".
