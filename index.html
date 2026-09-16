@@ -586,7 +586,13 @@ const state = {
   calYear: new Date().getFullYear(),
   calSelectedDate: new Date().toISOString().slice(0,10),
   taskTab: 'today',
-  toggles: { notif:true, remind1:true, remindSame:false, telegram:false },
+  toggles: (function(){
+    const def = { notif:true, remind1:true, remindSame:false, telegram:false };
+    try{
+      const saved = JSON.parse(localStorage.getItem('sahiya_toggles')||'null');
+      return saved ? {...def, ...saved} : def;
+    }catch(e){ return def; }
+  })(),
   telegramUserId: '',
   hbncType: 'HBNC',
   toast: null,
@@ -1230,6 +1236,7 @@ function toggleRow(key,label,icon){
 }
 /** Extra side-effects for a toggle flip, beyond flipping the in-memory flag. */
 function onToggleChanged(key){
+  try{ localStorage.setItem('sahiya_toggles', JSON.stringify(state.toggles)); }catch(e){}
   if(key==='notif') setPushEnabled(state.toggles.notif);
 }
 function screenSettings(){
