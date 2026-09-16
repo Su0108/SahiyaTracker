@@ -406,10 +406,16 @@ function notifyTelegramSelf(message){
   sb.functions.invoke('send-telegram', {body:{target:'user', message}}).catch(()=>{});
 }
 
-/** A short "who this is" line appended to admin Telegram alerts, so the
- *  admin can see the code/email/phone without switching to the panel first. */
-function sahiyaContactLine(code, email, phone){
-  return '\n(Code: '+(code||'\u2014')+' | Email: '+(email||'\u2014')+' | Phone: '+(phone||'\u2014')+')';
+/** Builds the standard admin-alert Telegram message used for every kind of
+ *  request (signup, data edit, record edit/delete, troubleshoot ticket):
+ *    Name: ...
+ *    Mobile No.: ...
+ *    Code No.: ...
+ *
+ *    Problem: ...
+ */
+function adminTelegramMessage(name, mobile, code, problem){
+  return 'Name: '+(name||'—')+'\nMobile No.: '+(mobile||'—')+'\nCode No.: '+(code||'—')+'\n\nProblem: '+problem;
 }
 
 const RECORD_BUCKETS = {family:'families', couple:'couples', ec:'ecRegisters', pregnancy:'pregnancies', anc:'ancVisits', child:'children', death:'deaths', hbnc:'hbncVisits'};
@@ -462,7 +468,7 @@ async function submitRecordApproval(action, recordType, recordId, payload, human
   });
   if(error) throw error;
   const verb = action==='record_delete' ? 'delete' : 'edit';
-  sb.functions.invoke('send-telegram', {body:{target:'admin', message:'New '+verb+' request from '+(state.profile.name||'a Sahiya')+' for '+humanLabel+'. Please review for approval.'+sahiyaContactLine(state.profile.code, state.profile.email, state.profile.number)}}).catch(()=>{});
+  sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(state.profile.name, state.profile.number, state.profile.code, 'New '+verb+' request for '+humanLabel+'. Please review for approval.')}}).catch(()=>{});
 }
 /** Withdraws a pending record-level request (used when the Sahiya cancels
  *  an edit/delete before the admin has decided on it). Best-effort. */
@@ -1290,7 +1296,7 @@ async function submitTroubleshootTicket(){
     const {data:{user}} = await sb.auth.getUser();
     const {error} = await sb.from('troubleshoot_tickets').insert({user_id:user.id, subject:'', message:query});
     if(error) throw error;
-    sb.functions.invoke('send-telegram', {body:{target:'admin', message:'New troubleshoot ticket from '+(state.profile.name||'a Sahiya')+': '+query+sahiyaContactLine(state.profile.code, state.profile.email, state.profile.number)}}).catch(()=>{});
+    sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(state.profile.name, state.profile.number, state.profile.code, query)}}).catch(()=>{});
     state.toast = {type:'success', text:'Your report has been sent to the admin'};
   }catch(e){
     state.toast = {type:'error', text: e.message || 'Could not send report'};
@@ -1398,6 +1404,7 @@ function downloadFamilyPDF(){
   field('Family ID', b.family.id);
   field('House No.', b.family.houseNo);
   field('Head of Family', b.family.headName);
+  field('Date of Birth (Head)', headOfFamilyDob(b.family));
   field('Phone No.', b.family.phone);
   if(b.family.otherPhones && b.family.otherPhones.length) field('Other Phone No.(s)', b.family.otherPhones.join(', '));
   field('Aadhar No. (Head)', b.family.aadhar);
@@ -1478,27 +1485,79 @@ function screenNotifications(){
       ${toggleRow('telegram','Telegram Notification',ICO('mail'))}
     </div>
     ${t.telegram ? `
-      <div class="field" style="margin-top:16px;">
-        <div class="field-label"><div class="fic">${ICO('idcard',12)}</div>Telegram User ID</div>
-        <input class="input" id="telegramId" placeholder="Enter your Telegram user ID" value="${state.telegramUserId}">
-        <div class="field-hint" style="margin-left:0;margin-top:6px;display:block;">You can get your user ID from @userinfobot on Telegram</div>
+      <div style="margin-top:16px;">
+        ${state.telegramUserId ? `
+          <div class="badge pending" style="display:inline-flex;align-items:center;gap:5px;background:#E7F7EC;color:#1F8B4C;margin-bottom:10px;">${ICO('save',12)} Telegram Connected</div>
+          <button class="save-btn" style="background:#fff;color:var(--sky-dark);border:1.5px solid var(--border);box-shadow:none;" onclick="disconnectTelegram()">${ICO('cross',14)} Disconnect Telegram</button>
+        ` : `
+          <div class="field-hint" style="margin-left:0;margin-bottom:10px;display:block;">Tap below, then press "Start" in Telegram — your account links automatically.</div>
+          <button class="save-btn" id="connectTelegramBtn" onclick="connectTelegram()">${ICO('mail',15)} Connect Telegram</button>
+        `}
       </div>
-      <button class="save-btn" onclick="saveTelegramId()">${ICO('save',15)} Save Telegram ID</button>
     ` : ''}
   </div>
   ${bottomNav('setting')}`;
 }
-async function saveTelegramId(){
-  const idVal = val('telegramId');
-  if(!idVal){ state.toast={type:'error', text:'Please enter your Telegram user ID'}; render(); return; }
+let _tgBotUsername = null;
+/** Bot username for the https://t.me/<username>?start=<token> deep link,
+ *  fetched from our own webhook function (which holds the bot token) so
+ *  the client never needs to know or store it. */
+async function getTelegramBotUsername(){
+  if(_tgBotUsername) return _tgBotUsername;
+  try{
+    const res = await fetch(SUPABASE_URL+'/functions/v1/telegram-webhook');
+    const j = await res.json();
+    _tgBotUsername = j.username || null;
+  }catch(e){ console.warn('Could not reach Telegram:', e.message); }
+  return _tgBotUsername;
+}
+async function connectTelegram(){
   try{
     const {data:{user}} = await sb.auth.getUser();
-    const {error} = await sb.from('profiles').update({telegram_user_id:idVal}).eq('id', user.id);
+    if(!user) return;
+    const {data:row, error} = await sb.from('telegram_link_tokens').insert({user_id:user.id}).select('token').single();
     if(error) throw error;
-    state.telegramUserId = idVal;
-    state.toast = {type:'success', text:'Telegram user ID saved'};
+    const username = await getTelegramBotUsername();
+    if(!username) throw new Error('Could not reach Telegram right now. Please try again.');
+    window.open('https://t.me/'+username+'?start='+row.token, '_blank');
+    state.toast = {type:'success', text:'Open Telegram and tap "Start" to finish connecting'};
+    render();
+    pollTelegramLinkStatus();
   }catch(e){
-    state.toast = {type:'error', text: e.message || 'Could not save Telegram ID'};
+    state.toast = {type:'error', text: e.message || 'Could not start Telegram connection'};
+    render();
+  }
+}
+/** After sending the person to Telegram, poll briefly for their profile's
+ *  telegram_user_id to appear (the webhook sets it once they hit Start),
+ *  so the Settings screen updates on its own without a manual refresh. */
+function pollTelegramLinkStatus(){
+  let tries = 0;
+  const iv = setInterval(async ()=>{
+    tries++;
+    try{
+      const {data:{user}} = await sb.auth.getUser();
+      if(!user){ clearInterval(iv); return; }
+      const {data:profile} = await sb.from('profiles').select('telegram_user_id').eq('id', user.id).single();
+      if(profile && profile.telegram_user_id){
+        state.telegramUserId = profile.telegram_user_id;
+        state.toast = {type:'success', text:'Telegram connected!'};
+        clearInterval(iv);
+        render();
+      }
+    }catch(e){}
+    if(tries>=20) clearInterval(iv);
+  }, 3000);
+}
+async function disconnectTelegram(){
+  try{
+    const {data:{user}} = await sb.auth.getUser();
+    const {error} = await sb.from('profiles').update({telegram_user_id:null}).eq('id', user.id);
+    if(error) throw error;
+    state.telegramUserId = '';
+    state.toast = {type:'success', text:'Telegram disconnected'};
+  }catch(e){
+    state.toast = {type:'error', text: e.message || 'Could not disconnect'};
   }
   render();
 }
@@ -1576,7 +1635,7 @@ async function requestProfileChange(field){
     const {data:{user}} = await sb.auth.getUser();
     const {data:edit, error} = await sb.from('data_edit_requests').insert({user_id:user.id, field:apiField, new_value:newVal}).select().single();
     if(error) throw error;
-    sb.functions.invoke('send-telegram', {body:{target:'admin', message:'New data edit request from '+(state.profile.name||'a Sahiya')+': change '+apiField+' to "'+newVal+'". Please review for approval.'+sahiyaContactLine(state.profile.code, state.profile.email, state.profile.number)}}).catch(()=>{});
+    sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(state.profile.name, state.profile.number, state.profile.code, 'Requesting to change '+apiField+' to "'+newVal+'". Please review for approval.')}}).catch(()=>{});
     if(field==='name'){ p.pendingName = newVal; p.pendingNameEditId = edit.id; state.toast={type:'success', text:'Name change request sent to admin for approval'}; }
     else { p.pendingNumber = newVal; p.pendingNumberEditId = edit.id; state.toast={type:'success', text:'Number change request sent to admin for approval'}; }
   }catch(e){
@@ -1948,7 +2007,7 @@ async function doSignup(){
       if(/duplicate|unique/i.test(profileErr.message)) throw new Error('That code number is already registered');
       throw profileErr;
     }
-    sb.functions.invoke('send-telegram', {body:{target:'admin', message:'New Sahiya signup request from '+name+'. Please review for approval.'+sahiyaContactLine(code, email, mobile)}}).catch(()=>{});
+    sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(name, mobile, code, 'New Sahiya signup request. Please review for approval.')}}).catch(()=>{});
   }catch(e){
     let msg = e.message || 'Could not create account';
     if(/already registered|already.*use/i.test(msg)) msg = 'An account already exists with this email';
@@ -2053,6 +2112,7 @@ function screenViewFamily(){
       <div class="field"><div class="field-label"><div class="fic">${ICO('idcard',12)}</div>Family ID</div><input class="input" value="${f.id}" disabled></div>
       <div class="field"><div class="field-label"><div class="fic">${ICO('house',12)}</div>House No.</div><input class="input" value="${f.houseNo||'—'}" disabled></div>
       <div class="field"><div class="field-label"><div class="fic">${ICO('person',12)}</div>Head of Family</div><input class="input" value="${f.headName||'—'}" disabled></div>
+      <div class="field"><div class="field-label"><div class="fic">${ICO('calendarDay',12)}</div>Date of Birth (Head of Family)</div><input class="input" value="${headOfFamilyDob(f)?headOfFamilyDob(f)+' ('+(ageStringFromDOB(headOfFamilyDob(f))||'—')+')':'—'}" disabled></div>
       <div class="field"><div class="field-label"><div class="fic">${ICO('phone',12)}</div>Phone No.</div><input class="input" value="${f.phone||'—'}" disabled></div>
       ${(f.otherPhones||[]).map(p=>`<div class="field"><div class="field-label"><div class="fic">${ICO('phone',12)}</div>Additional Mobile</div><input class="input" value="${p}" disabled></div>`).join('')}
       <div class="field"><div class="field-label"><div class="fic">${ICO('idcard',12)}</div>Aadhar No. of Head</div><input class="input" value="${f.aadhar||'—'}" disabled></div>
@@ -2665,6 +2725,17 @@ async function cancelRecordEditRequest(type, id){
 /* =========================================================
    FORM: FAMILY
    ========================================================= */
+/** The head-of-family's DOB, which the form now stores directly as
+ *  `headDob` on the family record — falls back to whichever member row
+ *  is marked/named as the head, for families saved before this field
+ *  existed. */
+function headOfFamilyDob(fam){
+  if(!fam) return '';
+  if(fam.headDob) return fam.headDob;
+  const members = fam.members || [];
+  const head = members.find(m=>m.isHead) || members.find(m=>(m.name||'').toLowerCase()===(fam.headName||'').toLowerCase());
+  return (head && head.dob) || '';
+}
 function screenFormFamily(){
   const seedYear = new Date().getFullYear();
   const editId = state.editFamilyId;
@@ -2685,6 +2756,7 @@ function screenFormFamily(){
     <div class="form-section">
       ${fText(ICO('house'),'House No.','houseNo','Enter house number','',false,'',src&&src.houseNo)}
       ${fText(ICO('person'),'Head of Family','headName','Enter head of family name','',false,'',src&&src.headName)}
+      ${fDate(ICO('calendarDay'),'Date of Birth (Head of Family)','headDob','','',src?headOfFamilyDob(src):'')}
       ${fText(ICO('phone'),'Phone No.','phone','Enter 10 digit mobile number','',false,'inputmode="numeric" oninput="digitsOnly(this,10)" maxlength="10"',src&&src.phone)}
       <div id="extraPhonesBody"></div>
       <div class="add-member" onclick="addPhoneRow()">${ICO('plus',13)} Add Another Mobile Number</div>
@@ -2711,6 +2783,7 @@ async function saveFamily(){
   hideFormError();
   const headName = val('headName');
   if(!headName){ showFormError('Head of Family name is required'); return; }
+  const headDob = val('headDob');
   const members = Array.from(document.querySelectorAll('#familyMembersBody .member-row')).map(r=>{
     const dob = r.querySelector('.member-dob').value;
     return {
@@ -2723,15 +2796,17 @@ async function saveFamily(){
   }).filter(m=>m.name);
   const otherPhones = Array.from(document.querySelectorAll('#extraPhonesBody .extra-phone'))
     .map(i=>i.value.trim()).filter(Boolean);
-  // Head of family is always counted as a member
+  // Head of family is always counted as a member, and shares the same DOB
+  // as the dedicated "Date of Birth (Head of Family)" field above.
   if(!members.some(m=>m.name.toLowerCase()===headName.toLowerCase())){
-    members.unshift({ name: headName, gender:'—', dob:'', age:'—', isHead:true });
+    members.unshift({ name: headName, gender:'—', dob: headDob, age: ageStringFromDOB(headDob) || '—', isHead:true });
   } else {
     const h = members.find(m=>m.name.toLowerCase()===headName.toLowerCase());
     h.isHead = true;
+    if(headDob){ h.dob = headDob; h.age = ageStringFromDOB(headDob) || '—'; }
   }
   const proposed = {
-    houseNo: val('houseNo'), headName, phone: val('phone'), otherPhones, aadhar: val('aadhar'),
+    houseNo: val('houseNo'), headName, headDob, phone: val('phone'), otherPhones, aadhar: val('aadhar'),
     religion: val('religion'), category: val('category'), members,
     nextVisit: val('nextVisitFamily'), disability: segVal('disability'),
   };
@@ -3228,12 +3303,16 @@ const TRANSLATIONS = {
 "Remind One Day Before": "এক দিন আগে মনে করিয়ে দিন",
 "Push Notifications": "পুশ বিজ্ঞপ্তি",
 "Telegram Notification": "টেলিগ্রাম বিজ্ঞপ্তি",
-"Telegram User ID": "টেলিগ্রাম ইউজার আইডি",
-"Enter your Telegram user ID": "আপনার টেলিগ্রাম ইউজার আইডি লিখুন",
-"You can get your user ID from @userinfobot on Telegram": "আপনি টেলিগ্রামে @userinfobot থেকে আপনার ইউজার আইডি পেতে পারেন",
-"Save Telegram ID": "টেলিগ্রাম আইডি সংরক্ষণ করুন",
-"Please enter your Telegram user ID": "আপনার টেলিগ্রাম ইউজার আইডি লিখুন",
-"Telegram user ID saved": "টেলিগ্রাম ইউজার আইডি সংরক্ষিত হয়েছে",
+"Telegram Connected": "টেলিগ্রাম সংযুক্ত",
+"Disconnect Telegram": "টেলিগ্রাম সংযোগ বিচ্ছিন্ন করুন",
+"Tap below, then press \"Start\" in Telegram — your account links automatically.": "নিচে ট্যাপ করুন, তারপর টেলিগ্রামে \"Start\" চাপুন — আপনার অ্যাকাউন্ট নিজে থেকেই লিংক হয়ে যাবে।",
+"Connect Telegram": "টেলিগ্রাম সংযুক্ত করুন",
+"Open Telegram and tap \"Start\" to finish connecting": "টেলিগ্রাম খুলে \"Start\" চাপুন সংযোগ সম্পন্ন করতে",
+"Could not start Telegram connection": "টেলিগ্রাম সংযোগ শুরু করা যায়নি",
+"Could not reach Telegram right now. Please try again.": "এই মুহূর্তে টেলিগ্রামে পৌঁছানো যাচ্ছে না। আবার চেষ্টা করুন।",
+"Telegram connected!": "টেলিগ্রাম সংযুক্ত হয়েছে!",
+"Telegram disconnected": "টেলিগ্রাম সংযোগ বিচ্ছিন্ন হয়েছে",
+"Could not disconnect": "সংযোগ বিচ্ছিন্ন করা যায়নি",
 "Manage your personal information": "আপনার ব্যক্তিগত তথ্য পরিচালনা করুন",
 "Sahiya Name": "সাহিয়ার নাম",
 "Changes need admin approval": "পরিবর্তনের জন্য অ্যাডমিনের অনুমোদন প্রয়োজন",
@@ -3614,12 +3693,16 @@ const TRANSLATIONS = {
 "Remind One Day Before": "एक दिन पहले याद दिलाएं",
 "Push Notifications": "पुश सूचनाएं",
 "Telegram Notification": "टेलीग्राम सूचना",
-"Telegram User ID": "टेलीग्राम यूज़र आईडी",
-"Enter your Telegram user ID": "अपना टेलीग्राम यूज़र आईडी दर्ज करें",
-"You can get your user ID from @userinfobot on Telegram": "आप टेलीग्राम पर @userinfobot से अपना यूज़र आईडी प्राप्त कर सकते हैं",
-"Save Telegram ID": "टेलीग्राम आईडी सहेजें",
-"Please enter your Telegram user ID": "अपना टेलीग्राम यूज़र आईडी दर्ज करें",
-"Telegram user ID saved": "टेलीग्राम यूज़र आईडी सहेजी गई",
+"Telegram Connected": "टेलीग्राम कनेक्टेड",
+"Disconnect Telegram": "टेलीग्राम डिस्कनेक्ट करें",
+"Tap below, then press \"Start\" in Telegram — your account links automatically.": "नीचे टैप करें, फिर टेलीग्राम में \"Start\" दबाएं — आपका खाता अपने आप लिंक हो जाएगा।",
+"Connect Telegram": "टेलीग्राम कनेक्ट करें",
+"Open Telegram and tap \"Start\" to finish connecting": "टेलीग्राम खोलें और कनेक्शन पूरा करने के लिए \"Start\" दबाएं",
+"Could not start Telegram connection": "टेलीग्राम कनेक्शन शुरू नहीं हो सका",
+"Could not reach Telegram right now. Please try again.": "अभी टेलीग्राम तक नहीं पहुंचा जा सका। कृपया फिर से कोशिश करें।",
+"Telegram connected!": "टेलीग्राम कनेक्ट हो गया!",
+"Telegram disconnected": "टेलीग्राम डिस्कनेक्ट हो गया",
+"Could not disconnect": "डिस्कनेक्ट नहीं किया जा सका",
 "Manage your personal information": "अपनी व्यक्तिगत जानकारी प्रबंधित करें",
 "Sahiya Name": "सहिया का नाम",
 "Changes need admin approval": "बदलाव के लिए एडमिन की मंज़ूरी ज़रूरी है",
