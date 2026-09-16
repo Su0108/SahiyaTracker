@@ -217,6 +217,22 @@ table tr:last-child td{border-bottom:none;}
 .modal .mrow span:first-child{color:var(--ink-soft);}
 .modal .mrow span:last-child{font-weight:600;text-align:right;}
 .modal .mfoot{display:flex;gap:10px;margin-top:18px;}
+
+.diffcell{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12.5px;}
+.diffcell .old{color:var(--ink-faint);text-decoration:line-through;}
+.diffcell .arrow{color:var(--ink-faint);}
+.diffcell .new{color:var(--green);font-weight:700;}
+.diffcell .multi{color:var(--ink-soft);font-weight:600;}
+.modal .mrow .diffval{display:flex;align-items:center;gap:6px;justify-content:flex-end;flex-wrap:wrap;}
+.modal .mrow .diffval .old{color:var(--ink-faint);text-decoration:line-through;font-weight:500;}
+.modal .mrow .diffval .arrow{color:var(--ink-faint);}
+.modal .mrow .diffval .new{color:var(--green);font-weight:700;}
+.difftable{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px;}
+.difftable th{text-align:left;color:var(--ink-soft);font-weight:700;font-size:11px;padding:6px 4px;border-bottom:2px solid var(--border);}
+.difftable td{padding:7px 4px;border-bottom:1px solid var(--border);vertical-align:top;}
+.difftable .old{color:var(--ink-faint);text-decoration:line-through;}
+.difftable .new{color:var(--green);font-weight:700;}
+.difftable .loading-row td{color:var(--ink-faint);text-align:center;padding:14px 4px;}
 .btn-ghost{background:var(--bg);border:1.5px solid var(--border);color:var(--ink);padding:11px 16px;border-radius:11px;font-weight:600;font-size:13.5px;flex:1;}
 .btn-ghost:hover{background:var(--border);}
 
@@ -299,6 +315,7 @@ async function refreshAdminData(){
   const profiles = profilesRes.data, edits = editsRes.data, tickets = ticketsRes.data, activity = activityRes.data;
 
   const byId = Object.fromEntries(profiles.map(p=>[p.id,p]));
+  DB.profilesById = byId;
 
   DB.sahiyas = profiles.filter(p=>!p.is_admin && (p.status==='active'||p.status==='suspended')).map(s=>({
     id: s.code, _uid: s.id, code: s.code, name: s.name, phone: s.phone, email: s.email,
@@ -323,9 +340,10 @@ async function refreshAdminData(){
 
   DB.dataEdits = edits.map(d=>{
     const s = byId[d.user_id];
+    const oldValue = (s && d.field && d.field in s) ? s[d.field] : undefined;
     return { id: d.id, sahiyaId: s?s.code:d.user_id, _uid: d.user_id, name: s?s.name:'', phone: s?s.phone:'',
       telegramUserId: s?s.telegram_user_id:null,
-      field: d.field, newValue: d.new_value, requestedOn: fmtDate(d.created_at), status: d.status,
+      field: d.field, oldValue, newValue: d.new_value, requestedOn: fmtDate(d.created_at), status: d.status,
       action: d.action||'field_edit', recordType: d.record_type, recordId: d.record_id, payload: d.payload };
   });
 
@@ -844,27 +862,46 @@ async function resolveTroubleshoot(id){
 }
 
 /* ============ DATA EDIT APPROVAL ============ */
+function escHtml(v){
+  return String(v).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtVal(v){
+  if(Array.isArray(v)) return v.length+' item(s)';
+  if(v==null || v==='') return '\u2014';
+  return escHtml(v);
+}
 function renderDataEdits(){
   const list = DB.dataEdits.filter(d=>d.status==='pending');
   const {slice, totalPages, page} = paginate(list, 'dataedits');
-  const rows = slice.map(d=>`
+  const rows = slice.map(d=>{
+    let changeCell;
+    if(d.action==='record_delete'){
+      changeCell = `<span class="diffcell"><span class="multi">Record will be deleted</span></span>`;
+    } else if(d.action!=='field_edit'){
+      const n = d.payload ? Object.keys(d.payload).length : 0;
+      changeCell = `<span class="diffcell"><span class="multi">${n} field${n===1?'':'s'} changed</span></span>`;
+    } else {
+      changeCell = `<span class="diffcell"><span class="old">${fmtVal(d.oldValue)}</span><span class="arrow">\u2192</span><span class="new">${fmtVal(d.newValue)}</span></span>`;
+    }
+    return `
     <tr>
       <td><div class="nameCell"><div class="av">${initials(d.name)}</div><b>${d.name}</b></div></td>
       <td>${d.phone}</td>
       <td>${d.field}</td>
+      <td>${changeCell}</td>
       <td>${d.requestedOn}</td>
       <td><div class="actions-cell">
         <button class="btn-xs btn-view" onclick="viewDataEdit('${d.id}')">View</button>
         <button class="btn-xs btn-approve" onclick="decideDataEdit('${d.id}',true)">Approve</button>
         <button class="btn-xs btn-reject" onclick="decideDataEdit('${d.id}',false)">Reject</button>
       </div></td>
-    </tr>`).join('') || `<tr><td colspan="5"><div class="empty">${I('pencil',30)}<br>No pending edit requests</div></td></tr>`;
+    </tr>`;}).join('') || `<tr><td colspan="6"><div class="empty">${I('pencil',30)}<br>No pending edit requests</div></td></tr>`;
 
   shell('dataedits', {title:'Data Edit Approval', sub:'Review and approve edit requests from Sahiya.'}, `
     <div class="card">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Name</th><th>Phone Number</th><th>Field</th><th>Requested On</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Name</th><th>Phone Number</th><th>Field</th><th>Change (Current \u2192 Requested)</th><th>Requested On</th><th>Actions</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -876,23 +913,70 @@ function viewDataEdit(id){
   const d=DB.dataEdits.find(x=>x.id===id);
   const isRecord = d.action!=='field_edit';
   const isDelete = d.action==='record_delete';
-  const payloadRows = d.payload ? Object.entries(d.payload).map(([k,v])=>{
-    const shown = Array.isArray(v) ? (v.length+' item(s)') : (v==null||v==='' ? '\u2014' : String(v));
-    return `<div class="mrow"><span>${k}</span><span>${shown}</span></div>`;
-  }).join('') : '';
-  document.getElementById('modalBox').innerHTML = `
-    <h3>${d.name}</h3>
-    <p class="msub">${isDelete ? 'Requesting deletion of' : 'Requesting a change to'}: ${d.field}</p>
-    <div class="mrow"><span>Phone</span><span>${d.phone}</span></div>
-    ${!isRecord ? `<div class="mrow"><span>Field</span><span>${d.field}</span></div>` : ''}
-    ${!isRecord && d.newValue ? `<div class="mrow"><span>Requested Value</span><span>${d.newValue}</span></div>` : ''}
-    ${isRecord && !isDelete ? `<div class="mrow"><span>Proposed changes</span><span></span></div>${payloadRows}` : ''}
-    <div class="mrow"><span>Requested On</span><span>${d.requestedOn}</span></div>
+
+  const footer = `
     <div class="mfoot">
       <button class="btn-ghost" onclick="closeModal()">Close</button>
       <button class="btn-xs ${isDelete?'btn-reject':'btn-approve'}" style="flex:1;padding:11px" onclick="decideDataEdit('${d.id}',true);closeModal()">${isDelete?'Approve Delete':'Approve'}</button>
     </div>`;
+
+  // Simple single-field edit: we already have the current value cached locally, no fetch needed.
+  if(!isRecord){
+    document.getElementById('modalBox').innerHTML = `
+      <h3>${d.name}</h3>
+      <p class="msub">Requesting a change to: ${d.field}</p>
+      <div class="mrow"><span>Phone</span><span>${d.phone}</span></div>
+      <div class="mrow"><span>Field</span><span>${d.field}</span></div>
+      <div class="mrow"><span>Current value</span><span>${fmtVal(d.oldValue)}</span></div>
+      <div class="mrow"><span>Requested value</span><span class="new" style="color:var(--green);font-weight:700;">${fmtVal(d.newValue)}</span></div>
+      <div class="mrow"><span>Requested On</span><span>${d.requestedOn}</span></div>
+      ${footer}`;
+    document.getElementById('modalBg').classList.add('show');
+    return;
+  }
+
+  // Record edit / delete: show what we know immediately, then fill in "current" values
+  // by looking up the live record, so the admin sees before-vs-after, not just the request.
+  const payloadKeys = d.payload ? Object.keys(d.payload) : [];
+  const loadingRows = payloadKeys.length
+    ? payloadKeys.map(k=>`<tr><td>${k}</td><td class="old">loading\u2026</td><td class="new">${fmtVal(d.payload[k])}</td></tr>`).join('')
+    : `<tr><td colspan="3">No field details attached to this request.</td></tr>`;
+
+  document.getElementById('modalBox').innerHTML = `
+    <h3>${d.name}</h3>
+    <p class="msub">${isDelete ? 'Requesting deletion of' : 'Requesting a change to'}: ${d.field}</p>
+    <div class="mrow"><span>Phone</span><span>${d.phone}</span></div>
+    <div class="mrow"><span>${isDelete?'Record':'Proposed changes'}</span><span></span></div>
+    <table class="difftable" id="dataEditDiffTable">
+      <thead><tr><th>Field</th><th>${isDelete?'Current (will be removed)':'Current'}</th><th>${isDelete?'':'Requested'}</th></tr></thead>
+      <tbody>${loadingRows}</tbody>
+    </table>
+    <div class="mrow"><span>Requested On</span><span>${d.requestedOn}</span></div>
+    ${footer}`;
   document.getElementById('modalBg').classList.add('show');
+
+  // Best-effort live lookup of the current record so we can show real "before" values.
+  if(d.recordType && d.recordId){
+    sb.from(d.recordType).select('*').eq('id', d.recordId).single().then(({data, error})=>{
+      const tbl = document.getElementById('dataEditDiffTable');
+      if(!tbl) return; // modal was closed/replaced before the lookup finished
+      const tbody = tbl.querySelector('tbody');
+      if(error || !data){
+        tbody.innerHTML = payloadKeys.length
+          ? payloadKeys.map(k=>`<tr><td>${k}</td><td class="old">\u2014</td><td class="new">${fmtVal(d.payload[k])}</td></tr>`).join('')
+          : `<tr><td colspan="3">Could not load the current record.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = payloadKeys.length
+        ? payloadKeys.map(k=>{
+            const cur = fmtVal(data[k]);
+            return isDelete
+              ? `<tr><td>${k}</td><td class="old">${cur}</td><td></td></tr>`
+              : `<tr><td>${k}</td><td class="old">${cur}</td><td class="new">${fmtVal(d.payload[k])}</td></tr>`;
+          }).join('')
+        : `<tr><td colspan="3">No field details attached to this request.</td></tr>`;
+    }).catch(()=>{});
+  }
 }
 async function decideDataEdit(id, approve){
   const d=DB.dataEdits.find(x=>x.id===id);
