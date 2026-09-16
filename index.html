@@ -419,6 +419,34 @@ function adminTelegramMessage(name, mobile, code, problem){
 }
 
 const RECORD_BUCKETS = {family:'families', couple:'couples', ec:'ecRegisters', pregnancy:'pregnancies', anc:'ancVisits', child:'children', death:'deaths', hbnc:'hbncVisits'};
+const SEQ_PREFIX = {couples:'COU', ecRegisters:'EC', pregnancies:'PRG', ancVisits:'ANC', children:'CHD', deaths:'DTH', hbncVisits:'HBN'};
+/** `seq` only lives in memory, so after (re)loading records from the server
+ *  it must be advanced past the highest number already used for each type —
+ *  otherwise nextId()/nextFamilyId() would hand out an ID that's already
+ *  taken, and saving that "new" record would silently overwrite (upsert
+ *  onConflict) the old one with the same id. */
+function resyncSeqFromDb(){
+  let maxFam = -1;
+  const code = state.profile && state.profile.code || '';
+  db.families.forEach(f=>{
+    if(code && f.id && f.id.indexOf(code)===0){
+      const n = parseInt(f.id.slice(code.length), 10);
+      if(!isNaN(n) && n>maxFam) maxFam = n;
+    }
+  });
+  if(maxFam>=0) seq.FAM = Math.max(seq.FAM, maxFam+1);
+  Object.keys(SEQ_PREFIX).forEach(bucket=>{
+    const prefix = SEQ_PREFIX[bucket];
+    let maxN = -1;
+    (db[bucket]||[]).forEach(r=>{
+      if(r.id && r.id.indexOf(prefix+'-')===0){
+        const n = parseInt(r.id.slice(prefix.length+1), 10);
+        if(!isNaN(n) && n>maxN) maxN = n;
+      }
+    });
+    if(maxN>=0) seq[prefix] = Math.max(seq[prefix], maxN+1);
+  });
+}
 let _lastRecordsSnapshot = null;
 /** Pulls this Sahiya's family/couple/EC/pregnancy/ANC/child/death/HBNC records into `db`.
  *  Returns true if anything actually changed since the last pull, so callers
@@ -427,7 +455,9 @@ let _lastRecordsSnapshot = null;
  *  Sahiya having to log out and back in. */
 async function pullRecordsIntoDb(){
   try{
-    const {data:records, error} = await sb.from('records').select('type,record_id,data');
+    const {data:{user}} = await sb.auth.getUser();
+    if(!user) return false;
+    const {data:records, error} = await sb.from('records').select('type,record_id,data').eq('user_id', user.id);
     if(error) throw error;
     const next = {};
     Object.keys(RECORD_BUCKETS).forEach(t=>{ next[RECORD_BUCKETS[t]] = []; });
@@ -436,6 +466,7 @@ async function pullRecordsIntoDb(){
     const changed = snapshot !== _lastRecordsSnapshot;
     _lastRecordsSnapshot = snapshot;
     Object.keys(next).forEach(k=>{ db[k] = next[k]; });
+    resyncSeqFromDb();
     return changed;
   }catch(e){ console.warn('Could not load records from server:', e.message); return false; }
 }
@@ -444,15 +475,12 @@ async function pullRecordsIntoDb(){
 async function persistRecord(type, recordId, data){
   try{
     const {data:{user}} = await sb.auth.getUser();
-    if(!user) return;
-    await sb.from('records').upsert({user_id:user.id, type, record_id:String(recordId), data}, {onConflict:'user_id,type,record_id'});
-  }catch(e){ console.warn('Sync failed for', type, recordId, e.message); }
+    if(!user) return false;
+    const {error} = await sb.from('records').upsert({user_id:user.id, type, record_id:String(recordId), data}, {onConflict:'user_id,type,record_id'});
+    if(error) throw error;
+    return true;
+  }catch(e){ console.warn('Sync failed for', type, recordId, e.message); return false; }
 }
-function deleteRecordRemote(type, recordId){
-  sb.from('records').delete().eq('type', type).eq('record_id', String(recordId))
-    .then(({error})=>{ if(error) console.warn('Remote delete failed for', type, recordId, error.message); });
-}
-
 /** Files a record-level edit/delete request with the admin (mirrors the
  *  profile name/number change flow): inserts a row into data_edit_requests
  *  so it shows up in the admin panel's Data Edit Approval queue, and pings
@@ -1901,6 +1929,18 @@ async function finishLoginFromSession(fallbackCode){
   if(!user){ state.toast={type:'error', text:'Could not reach the server. Please try again.'}; render(); return; }
   const {data:u, error} = await sb.from('profiles').select('*').eq('id', user.id).single();
   if(error || !u){
+    try{
+      const created = await completeProfileFromMetadata(user);
+      if(created){
+        state.userName = created.name;
+        setMyCode(created.code);
+        go('verify');
+        return;
+      }
+    }catch(e){
+      state.toast={type:'error', text: e.message || 'Could not finish signup. Please contact support.'};
+      render(); return;
+    }
     state.toast={type:'error', text:'No account found. Please check your details or sign up.'};
     render(); return;
   }
@@ -1995,6 +2035,17 @@ function screenSignup(){
     </div>
   </div>`;
 }
+async function completeProfileFromMetadata(user){
+  const meta = user.user_metadata || {};
+  if(!meta.code || !meta.name) return null;
+  const {error: profileErr} = await sb.from('profiles').insert({id:user.id, code:meta.code, name:meta.name, phone:meta.phone||'', email:user.email});
+  if(profileErr){
+    if(/duplicate|unique/i.test(profileErr.message)) throw new Error('That code number is already registered');
+    throw profileErr;
+  }
+  sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(meta.name, meta.phone||'', meta.code, 'New Sahiya signup request. Please review for approval.')}}).catch(()=>{});
+  return {name: meta.name, code: meta.code};
+}
 async function doSignup(){
   const name = val('suName'), mobile = val('suMobile'), email = val('suEmail'), pass = val('suPassword'), code = val('suCode');
   if(!name){ state.toast={type:'error', text:'Please enter your full name'}; render(); return; }
@@ -2004,18 +2055,13 @@ async function doSignup(){
   if(!code){ state.toast={type:'error', text:'Please enter your code number'}; render(); return; }
 
   try{
-    const {data, error} = await sb.auth.signUp({email, password: pass});
+    const {data, error} = await sb.auth.signUp({email, password: pass, options:{data:{name, phone:mobile, code}}});
     if(error) throw error;
     if(!data.session){
       state.toast={type:'error', text:'Account created — please confirm your email, then log in to finish signing up.'};
       render(); return;
     }
-    const {error: profileErr} = await sb.from('profiles').insert({id:data.user.id, code, name, phone:mobile, email});
-    if(profileErr){
-      if(/duplicate|unique/i.test(profileErr.message)) throw new Error('That code number is already registered');
-      throw profileErr;
-    }
-    sb.functions.invoke('send-telegram', {body:{target:'admin', message:adminTelegramMessage(name, mobile, code, 'New Sahiya signup request. Please review for approval.')}}).catch(()=>{});
+    await completeProfileFromMetadata(data.user);
   }catch(e){
     let msg = e.message || 'Could not create account';
     if(/already registered|already.*use/i.test(msg)) msg = 'An account already exists with this email';
@@ -2349,7 +2395,7 @@ function vaxIsActionable(status){
 }
 function screenListDue(){
   return listScreen({
-    title:'Injunction / Due List', sub:'Vaccination due tracker by child', illus:'due', addLabel:'Add Child to start tracking', formScreen:'form-child',
+    title:'Injection / Due List', sub:'Vaccination due tracker by child', illus:'due', addLabel:'Add Child to start tracking', formScreen:'form-child',
     getItems:()=>db.children,
     renderItem:(c)=>{
       const statuses = c.vaccines.map(v=>vaxStatus(c,v));
@@ -2406,7 +2452,7 @@ function screenDueDetail(){
     </div>`;
   }).join('');
   return `
-  ${headerBack('Injunction / Due List','Track child vaccination and injection details','list-due','due')}
+  ${headerBack('Injection / Due List','Track child vaccination and injection details','list-due','due')}
   <div class="content">
     ${toastHtml()}
     <div class="form-section" style="margin-bottom:14px;">
@@ -2452,8 +2498,16 @@ function toggleVax(childId, idx){
     render();
     return;
   }
+  const prevStatus = v.status;
   v.status = v.status==='done' ? 'auto' : 'done';
   render();
+  persistRecord('child', c.id, c).then(ok=>{
+    if(ok===false){
+      v.status = prevStatus;
+      state.toast = {type:'error', text:'Could not save. Check your connection and try again.'};
+      render();
+    }
+  });
 }
 
 /* =========================================================
@@ -2791,6 +2845,8 @@ async function saveFamily(){
   hideFormError();
   const headName = val('headName');
   if(!headName){ showFormError('Head of Family name is required'); return; }
+  const phone = val('phone');
+  if(!phone){ showFormError('Phone No. is required'); return; }
   const headDob = val('headDob');
   const members = Array.from(document.querySelectorAll('#familyMembersBody .member-row')).map(r=>{
     const dob = r.querySelector('.member-dob').value;
@@ -3096,6 +3152,8 @@ function saveChild(){
   const childName = val('childNameChild'); const familyId = val('familyIdChild');
   if(!familyId){ showFormError('Please select a Family ID'); return; }
   if(!childName){ showFormError("Child's name is required"); return; }
+  const dobChild = val('dobChild');
+  if(!dobChild){ showFormError('Date of Birth is required'); return; }
   const motherCouple = db.couples.find(c=>c.id===val('motherIdChild'));
   {
     const rec = {
@@ -3136,12 +3194,16 @@ function screenFormDeath(){
 }
 function saveDeath(){
   hideFormError();
+  const familyId = val('familyIdDeath');
+  if(!familyId){ showFormError('Please select a Family ID'); return; }
   const personName = val('personNameDeath');
   if(!personName){ showFormError('Deceased person name is required'); return; }
+  const dodDeath = val('dodDeath');
+  if(!dodDeath){ showFormError('Date of Death is required'); return; }
   {
     const rec = {
-      id: nextId('DTH'), familyId: val('familyIdDeath'), personName, parentSpouseName: val('parentSpouseDeath'),
-      dob: val('dobDeath'), gender: segVal('deathGender'), dod: val('dodDeath'), tod: val('todDeath'), cause: val('causeDeath'),
+      id: nextId('DTH'), familyId, personName, parentSpouseName: val('parentSpouseDeath'),
+      dob: val('dobDeath'), gender: segVal('deathGender'), dod: dodDeath, tod: val('todDeath'), cause: val('causeDeath'),
       pendingEdit: null, pendingDelete: false,
     };
     db.deaths.push(rec);
@@ -3443,7 +3505,7 @@ const TRANSLATIONS = {
 "Child Age": "শিশুর বয়স",
 "Auto filled (e.g. 1 year 3 months)": "স্বয়ংক্রিয়ভাবে পূরণ (যেমন ১ বছর ৩ মাস)",
 "Child Name": "শিশুর নাম",
-"Injunction / Due List": "বকেয়া তালিকা",
+"Injection / Due List": "বকেয়া তালিকা",
 "Track child vaccination and injection details": "শিশুর টিকাদান এবং ইনজেকশনের বিবরণ ট্র্যাক করুন",
 "Family Details": "পারিবারিক বিবরণ",
 "Delete requested — waiting for admin approval": "মুছে ফেলার অনুরোধ করা হয়েছে — অ্যাডমিনের অনুমোদনের অপেক্ষায়",
@@ -3833,7 +3895,7 @@ const TRANSLATIONS = {
 "Child Age": "बच्चे की आयु",
 "Auto filled (e.g. 1 year 3 months)": "स्वतः भरा गया (जैसे 1 वर्ष 3 महीने)",
 "Child Name": "बच्चे का नाम",
-"Injunction / Due List": "बकाया सूची",
+"Injection / Due List": "बकाया सूची",
 "Track child vaccination and injection details": "बच्चे के टीकाकरण और इंजेक्शन का विवरण ट्रैक करें",
 "Family Details": "पारिवारिक विवरण",
 "Delete requested — waiting for admin approval": "हटाने का अनुरोध किया गया — एडमिन की मंज़ूरी की प्रतीक्षा में",
